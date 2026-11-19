@@ -1,0 +1,130 @@
+name: Build AltStore IPA
+
+# Personal, non-commercial build of OpenClient (PolyForm Noncommercial 1.0.0).
+# This fork changes NO upstream files: everything private lives in .github/ and
+# scripts/altstore/, so merging upstream never conflicts.
+#
+# Uses the existing "Profile" configuration (release optimisation + DEBUG flag),
+# in which CommerceStore defaults to debugEntitlementOverride = .unlocked
+# => no prompt or session limits.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/**", "scripts/altstore/**"]
+  schedule:
+    - cron: "17 4 * * *" # daily: pull upstream, rebuild if something changed
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ipa
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge upstream (ntoporcov/openclient)
+        id: sync
+        run: |
+          git config user.name "openclient-personal-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git remote add upstream https://github.com/ntoporcov/openclient.git || true
+          git fetch upstream main
+          before=$(git rev-parse HEAD)
+          if ! git merge --no-edit upstream/main; then
+            git merge --abort
+            echo "::error::Upstream merge conflict - resolve manually"
+            exit 1
+          fi
+          after=$(git rev-parse HEAD)
+          if [ "$before" != "$after" ]; then
+            git push origin HEAD:main || echo "::warning::push of merged upstream failed (workflow files changed upstream?)"
+          fi
+          echo "head=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if already built
+        id: skip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="build-${{ steps.sync.outputs.head }}"
+          if [ "${{ github.event_name }}" = "schedule" ] && gh release view "$tag" >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Select newest Xcode
+        if: steps.skip.outputs.already == 'false'
+        run: |
+          ls /Applications | grep -i '^Xcode' || true
+          latest=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$latest" ] && sudo xcode-select -s "$latest"
+          xcodebuild -version
+
+      - name: Install tools
+        if: steps.skip.outputs.already == 'false'
+        run: brew install xcodegen ldid
+
+      - name: Generate Xcode project
+        if: steps.skip.outputs.already == 'false'
+        run: xcodegen generate
+
+      - name: Build (unsigned, Profile = DEBUG flag => unlocked)
+        if: steps.skip.outputs.already == 'false'
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project OpenCodeIOSClient.xcodeproj \
+            -scheme OpenCodeIOSClient \
+            -configuration Profile \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            -skipPackagePluginValidation -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log | tail -n 40
+
+      - name: Package IPA
+        if: steps.skip.outputs.already == 'false'
+        run: bash scripts/altstore/package-ipa.sh build/Build/Products/Profile-iphoneos OpenClient-altstore.ipa
+
+      - name: Source manifest
+        if: steps.skip.outputs.already == 'false'
+        run: bash scripts/altstore/make-source.sh OpenClient-altstore.ipa altstore-source.json "${{ github.repository }}"
+
+      - name: Publish release
+        if: steps.skip.outputs.already == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="build-${{ steps.sync.outputs.head }}"
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest OpenClient-altstore.ipa altstore-source.json \
+            --title "OpenClient (private) ${tag}" \
+            --notes "Unsigned IPA for AltStore. Upstream commit ${{ steps.sync.outputs.head }}." --latest
+          gh release create "$tag" --title "$tag" --notes "marker" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: steps.skip.outputs.already == 'false'
+        with:
+          name: OpenClient-altstore-ipa
+          path: |
+            OpenClient-altstore.ipa
+            altstore-source.json
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-log
+          path: build.log
